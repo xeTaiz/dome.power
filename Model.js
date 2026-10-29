@@ -48,12 +48,38 @@ function parseChargeLimit(raw) {
   return Number(percentages[percentages.length - 1].replace(/\D/g, ""))
 }
 
+function parseBatteryTemperature(raw) {
+  // Match the named battery sensor, never a CPU/board sensor or an error value.
+  var match = String(raw || "").match(/^\s*(?:Battery|battery_temp(?:@[0-9a-f]+)?):\s*(-?\d+(?:\.\d+)?)\s*(?:°\s*)?C\s*$/im)
+  if (!match) return null
+  var value = Number(match[1])
+  return isFinite(value) && value >= -40 && value <= 100 ? value : null
+}
+
 function shouldRequestChargeLimit(currentLimit, desiredLimit, blockedTarget) {
   return currentLimit !== desiredLimit && blockedTarget !== desiredLimit
 }
 
 function keepBoostActive(requested, batteryFull) {
   return requested === true && batteryFull !== true
+}
+
+function shouldEnablePowerSaver(enabled, present, onBattery, fraction) {
+  return enabled === true && present === true && onBattery === true
+    && typeof fraction === "number" && isFinite(fraction)
+    && fraction >= 0 && fraction < 0.20
+}
+
+function normalizeHibernateThreshold(value) {
+  var threshold = Math.round(Number(value))
+  return isFinite(threshold) ? Math.max(5, Math.min(30, threshold)) : 10
+}
+
+function shouldHibernate(enabled, present, onBattery, fraction, threshold, attempted) {
+  return enabled === true && present === true && onBattery === true
+    && typeof fraction === "number" && isFinite(fraction)
+    && fraction >= 0 && fraction <= normalizeHibernateThreshold(threshold) / 100
+    && attempted !== true
 }
 
 function clampChargeLimit(value) {
@@ -129,8 +155,12 @@ if (typeof module !== "undefined") {
     parseKeyValue: parseKeyValue,
     parseProfiles: parseProfiles,
     parseChargeLimit: parseChargeLimit,
+    parseBatteryTemperature: parseBatteryTemperature,
     shouldRequestChargeLimit: shouldRequestChargeLimit,
     keepBoostActive: keepBoostActive,
+    shouldEnablePowerSaver: shouldEnablePowerSaver,
+    normalizeHibernateThreshold: normalizeHibernateThreshold,
+    shouldHibernate: shouldHibernate,
     clampChargeLimit: clampChargeLimit,
     normalizeChargeLimitStep: normalizeChargeLimitStep,
     stepChargeLimit: stepChargeLimit,

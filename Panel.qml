@@ -14,6 +14,8 @@ Panel {
   // permits — needed for the togglePercentage method below.
   manageIpc: false
   property var batteryInfo: ({})
+  property var batteryTemperature: null
+  property string batteryTemperatureError: ""
   property var systemInfo: ({})
   property var profiles: []
   property string activeProfile: ""
@@ -27,6 +29,7 @@ Panel {
   property int blockedChargeLimitTarget: -1
   property string cursorSection: "profiles"
   property int chargeControlIndex: 2
+  property int lowBatteryControlIndex: 2
   readonly property int minimumChargeLimit: 40
   readonly property int maximumChargeLimit: 100
   readonly property int defaultChargeLimit: Model.clampChargeLimit(setting("defaultChargeLimit", 80))
@@ -37,6 +40,49 @@ Panel {
   readonly property bool boostVisualActive: chargeToFull || (chargeLimitProc.running && pendingChargeToFull)
   property bool cursorActive: false
   readonly property bool showPercentage: setting("showPercentage", false) === true
+  readonly property bool lowBatteryHibernate: setting("lowBatteryHibernate", false) === true
+  readonly property int hibernateThreshold: Model.normalizeHibernateThreshold(setting("hibernateThreshold", 10))
+  readonly property bool lowBatteryPowerSaver: setting("lowBatteryPowerSaver", false) === true
+  property string powerSaverError: ""
+  property bool hibernateAttempted: false
+  property bool hibernateAvailable: false
+  property string hibernateError: ""
+
+  function checkLowBatteryPowerSaver() {
+    var device = UPower.displayDevice
+    var fraction = device ? device.percentage : NaN
+    if (Model.shouldEnablePowerSaver(lowBatteryPowerSaver, batteryPresent, UPower.onBattery, fraction)) {
+      if (!powerSaverProc.running) powerSaverProc.running = true
+    } else powerSaverError = ""
+  }
+
+  function checkLowBattery() {
+    var device = UPower.displayDevice
+    var fraction = device ? device.percentage : NaN
+    // Rearm only after plugging in or charging above the threshold + 2%.
+    // This avoids immediately hibernating again when resuming at low charge.
+    if (!UPower.onBattery || (isFinite(fraction) && fraction > (hibernateThreshold + 2) / 100))
+      hibernateAttempted = false
+    if (!Model.shouldHibernate(lowBatteryHibernate, batteryPresent, UPower.onBattery,
+        fraction, hibernateThreshold, hibernateAttempted)) return
+    if (!hibernateAvailable || hibernateProc.running) return
+    hibernateAttempted = true
+    hibernateError = ""
+    hibernateProc.running = true
+  }
+
+  function setHibernateThreshold(delta) {
+    root.settings = Object.assign({}, root.settings, {
+      hibernateThreshold: Model.normalizeHibernateThreshold(hibernateThreshold + delta)
+    })
+  }
+
+  function toggleLowBatteryHibernate() {
+    root.settings = Object.assign({}, root.settings, { lowBatteryHibernate: !lowBatteryHibernate })
+    hibernateAttempted = false
+    hibernateError = ""
+    hibernateCheckProc.running = true
+  }
   // With the percentage shown the button paints a text block wider than an
   // icon, so the open-panel mark takes the painted width instead of the
   // icon-sized fraction of the slot the fallback assumes.
@@ -65,15 +111,21 @@ Panel {
       return
     }
 
+    if (cursorSection === "lowBattery") {
+      if (dx !== 0) lowBatteryControlIndex = Math.max(0, Math.min(2, lowBatteryControlIndex + dx))
+      else if (dy < 0) cursorSection = "charge"
+      else if (dy > 0) cursorSection = "profiles"
+      return
+    }
     if (cursorSection === "charge") {
       if (dx !== 0) chargeControlIndex = Math.max(0, Math.min(2, chargeControlIndex + dx))
-      else if (dy > 0) cursorSection = "profiles"
+      else if (dy > 0) cursorSection = "lowBattery"
       return
     }
 
     if (dy < 0) {
-      cursorSection = "charge"
-      chargeControlIndex = 2
+      cursorSection = "lowBattery"
+      lowBatteryControlIndex = 2
       return
     }
 
@@ -83,7 +135,12 @@ Panel {
 
   function activateCursor() {
     if (!cursorActive) return
-    if (cursorSection === "charge") activateChargeControl()
+    if (cursorSection === "lowBattery") {
+      if (lowBatteryControlIndex === 0) setHibernateThreshold(-1)
+      else if (lowBatteryControlIndex === 1) setHibernateThreshold(1)
+      else if (!hibernateCheckProc.running && !hibernateProc.running) toggleLowBatteryHibernate()
+    }
+    else if (cursorSection === "charge") activateChargeControl()
     else activateSelectedProfile()
   }
 
@@ -187,6 +244,7 @@ Panel {
     if (!batteryPresent) return
 
     if (!batteryProc.running) batteryProc.running = true
+    if (!thermalProc.running) thermalProc.running = true
     if (!profilesProc.running) profilesProc.running = true
     if (!chargeReadProc.running && !chargeLimitProc.running) chargeReadProc.running = true
     if (!systemProc.running) systemProc.running = true
@@ -314,6 +372,57 @@ Panel {
 
   Component.onCompleted: {
     if (batteryPresent && !chargeReadProc.running) chargeReadProc.running = true
+    hibernateCheckProc.running = true
+  }
+
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    onTriggered: root.checkLowBattery()
+  }
+
+  Timer {
+    interval: 300000
+    running: root.lowBatteryPowerSaver
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.checkLowBatteryPowerSaver()
+  }
+
+  Process {
+    id: powerSaverProc
+    // Recheck AC at execution time and leave Omarchy's saved battery profile unchanged.
+    command: ["timeout", "--kill-after=2s", "10s", "bash", "-c", "[ \"$(busctl get-property org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower OnBattery)\" = 'b true' ] || exit 0; current=$(powerprofilesctl get) || exit; [ \"$current\" = power-saver ] || powerprofilesctl set power-saver"]
+    onExited: function(exitCode, exitStatus) {
+      root.powerSaverError = exitCode === 0 ? "" : "Could not enable Power Saver. Check power-profiles-daemon."
+      if (!profilesProc.running) profilesProc.running = true
+    }
+  }
+
+  Process {
+    id: hibernateCheckProc
+    command: ["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+      "org.freedesktop.login1.Manager", "CanHibernate"]
+    stdout: StdioCollector { id: hibernateCheckOutput; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      root.hibernateAvailable = exitCode === 0 && hibernateCheckOutput.text.trim() === 's "yes"'
+      if (!root.hibernateAvailable)
+        root.hibernateError = "Automatic hibernation needs configured hibernation and permission without a password."
+      else root.hibernateError = ""
+      Qt.callLater(root.checkLowBattery)
+    }
+  }
+
+  Process {
+    id: hibernateProc
+    // Respect logind inhibitors and do not prompt for authentication in the background.
+    command: ["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+      "org.freedesktop.login1.Manager", "Hibernate", "b", "false"]
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode !== 0)
+        root.hibernateError = "Could not hibernate. Connect power and check hibernation permissions or inhibitors."
+    }
   }
 
   visible: batteryPresent
@@ -324,6 +433,20 @@ Panel {
     id: batteryProc
     command: ["omarchy-battery-status", "--shell"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "battery") }
+  }
+
+  Process {
+    id: thermalProc
+    command: ["sudo", "-n", "/usr/bin/framework_tool", "--thermal"]
+    stdout: StdioCollector { id: thermalOutput; waitForEnd: true }
+    stderr: StdioCollector { id: thermalError; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      root.batteryTemperature = exitCode === 0 ? Model.parseBatteryTemperature(thermalOutput.text) : null
+      root.batteryTemperatureError = root.batteryTemperature !== null ? ""
+        : (String(thermalError.text || "").indexOf("password is required") >= 0
+          ? "Allow passwordless framework_tool --thermal to read battery temperature."
+          : "Battery temperature is unavailable.")
+    }
   }
 
   Process {
@@ -597,6 +720,10 @@ Panel {
             spacing: Style.spacing.labelGap
             InfoPair { label: "Battery size"; value: root.batteryInfo.size || "" }
             InfoPair { label: "Charge cycles"; value: root.batteryInfo.cycles || "—" }
+            InfoPair {
+              label: "Battery temp"
+              value: root.batteryTemperature !== null ? root.batteryTemperature + " °C" : "—"
+            }
           }
 
           Column {
@@ -611,6 +738,18 @@ Panel {
               value: root.chargeThresholdActive ? "Holding" : (root.batteryFull ? "-" : (root.batteryInfo.rate || ""))
             }
           }
+        }
+
+        Text {
+          visible: root.batteryTemperatureError !== ""
+          width: parent.width
+          text: root.batteryTemperatureError
+          textFormat: Text.PlainText
+          color: root.bar.foreground
+          opacity: 0.6
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         // ---------- Framework charge limit ----------
@@ -758,6 +897,78 @@ Panel {
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
           }
+        }
+
+        PanelSeparator { foreground: root.bar.foreground }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+          PanelSectionHeader {
+            text: "LOW BATTERY"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+          Row {
+            spacing: Style.space(10)
+            Button {
+              text: "−"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              enabled: root.hibernateThreshold > 5
+              hasCursor: root.cursorActive && root.cursorSection === "lowBattery" && root.lowBatteryControlIndex === 0
+              onClicked: root.setHibernateThreshold(-1)
+            }
+            Button {
+              text: root.hibernateThreshold + "%"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              enabled: false
+            }
+            Button {
+              text: "+"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              enabled: root.hibernateThreshold < 30
+              hasCursor: root.cursorActive && root.cursorSection === "lowBattery" && root.lowBatteryControlIndex === 1
+              onClicked: root.setHibernateThreshold(1)
+            }
+            Button {
+              text: root.lowBatteryHibernate ? "Auto: ON" : "Auto: OFF"
+              tooltipText: "Toggle automatic low-battery hibernation"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              active: root.lowBatteryHibernate
+              hasCursor: root.cursorActive && root.cursorSection === "lowBattery" && root.lowBatteryControlIndex === 2
+              enabled: !hibernateCheckProc.running && !hibernateProc.running
+              onClicked: root.toggleLowBatteryHibernate()
+            }
+          }
+          Text {
+            width: parent.width
+            text: root.hibernateError || (root.lowBatteryHibernate
+              ? "Automatic hibernation is on: hibernate at " + root.hibernateThreshold + "% while on battery. Preparing hibernation may take a minute or more; wait for the computer to power off."
+              : "Automatic low-battery hibernation is off.")
+            color: root.bar.foreground
+            opacity: 0.6
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Text {
+          visible: root.lowBatteryPowerSaver || root.powerSaverError !== ""
+          width: parent.width
+          text: root.powerSaverError || "Auto Power Saver: below 20% while on battery (checked every 5 minutes)."
+          color: root.bar.foreground
+          opacity: 0.6
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         // ---------- Power profile picker ----------

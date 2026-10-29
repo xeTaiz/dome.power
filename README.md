@@ -13,6 +13,8 @@ Framework ChargeLimit Power is derived from Omarchy's built-in `omarchy.power` w
 - Configurable Framework charge limit in the panel
 - Boost mode that temporarily raises the Framework charge limit to 100%
 - Automatic restoration of the normal charge limit after UPower reports a full battery
+- Optional automatic hibernation at a configurable low-battery percentage
+- Battery temperature from the Framework EC's named battery sensor
 - CPU, memory, temperature, and uptime statistics
 
 ## Requirements
@@ -95,6 +97,24 @@ Then reload the shell if the widget was already running:
 omarchy restart shell
 ```
 
+## Battery temperature permission
+
+The panel displays **Battery temp** and refreshes it every five seconds while
+open, using `sudo -n /usr/bin/framework_tool --thermal`. Only the sensor named
+`Battery`, `battery_temp`, or `battery_temp@<hex address>` is displayed. Missing sensors and read failures show `—` and an
+explanation rather than a stale temperature.
+
+To allow background reads, add this exact read-only command to a sudoers file
+with `sudo visudo -f /etc/sudoers.d/framework-battery-temperature`:
+
+```sudoers
+YOUR_USERNAME ALL=(root) NOPASSWD: /usr/bin/framework_tool --thermal
+```
+
+Replace `YOUR_USERNAME` with your login name, then verify with
+`sudo -n /usr/bin/framework_tool --thermal`. Do not grant unrestricted access
+to `framework_tool`; this rule permits only its temperature/fan status query.
+
 ## Configuration
 
 The widget accepts these optional values in its `shell.json` bar entry:
@@ -112,6 +132,49 @@ The widget accepts these optional values in its `shell.json` bar entry:
 - `showPercentage`: show the battery percentage in the bar button. Default: `false`.
 
 Omarchy manages the temporary `chargeToFull` setting when Boost is toggled. It should not normally be edited by hand.
+
+### Low-battery Power Saver
+
+Set `"lowBatteryPowerSaver": true` to automatically select `power-saver` when
+running on battery below 20% (strictly less than 20%). Off by default. Checks
+run once when enabled/loaded, then every 5 minutes while the widget is loaded,
+even with the panel closed. The check is separate from the 15-second hibernation
+check. It reuses one process, skips overlapping runs, and limits each command to
+10 seconds (with forced termination after a further 2 seconds). No history or
+subprocess output is accumulated.
+The current profile is queried before switching; errors appear in the panel.
+This temporary change does not overwrite Omarchy's saved battery profile.
+Plugging in restores the AC profile through Omarchy's existing battery service.
+The plugin does not restore a previous profile merely because charge rises
+above 20%; manual profile changes below 20% are overridden on the next check.
+Requires `power-profiles-daemon` with the `power-saver` profile available.
+
+### Low-battery hibernation
+
+The **LOW BATTERY** controls select a threshold from 5–30% (default: 10%) and
+toggle **Auto: ON / Auto: OFF**. The button controls automatic hibernation; it does not request immediate manual hibernation. This feature is off by default. The equivalent widget
+settings are `"lowBatteryHibernate": true` and `"hibernateThreshold": 10`.
+
+When enabled, the widget checks UPower every 15 seconds, even with the panel
+closed, and requests hibernation at or below the threshold while on battery.
+Preparing the memory image and writing it to disk may take a minute or more, during which the lock screen may appear unresponsive. Wait for the computer to power off.
+
+This saves the session to disk; it is separate from the Framework charging
+ceiling and does not change EC settings. It requires working system
+hibernation (swap/resume configured) and logind permission without a password.
+`busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate`
+must return `s "yes"`. No additional passwordless Framework sudo rule is needed.
+
+Requests respect system sleep inhibitors. If hibernation is unavailable or
+fails, the panel displays an error; it does not silently substitute suspend
+or shutdown. After an attempt, the widget rearms when AC is connected or the
+battery rises more than two percentage points above the threshold, avoiding
+an immediate hibernation loop after resume. Plugin or shell restarts reset
+this guard, so restarting on low battery can request hibernation again.
+
+This protection operates only while Omarchy shell and this widget are running.
+It cannot monitor a powered-off or suspended machine. Keep system-level
+critical-battery protection enabled as a fallback.
 
 ## How Boost turns itself off
 
